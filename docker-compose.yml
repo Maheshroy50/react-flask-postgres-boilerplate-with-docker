@@ -1,4 +1,4 @@
-version: '3.5'
+version: '3.8'  # Updated to modern version
 
 services:
 
@@ -21,7 +21,7 @@ services:
       context: ./backend/
       dockerfile: Dockerfile
     ports:
-      - "5000:80"
+      - "5000:5000"  # <--- FIXED: Matches app.py port
     volumes:
       - ./backend:/usr/src/app
     depends_on:
