@@ -21,8 +21,8 @@ def register_extensions(app):
 
 app = create_app(Config)
 
-
-# Run the application
+# --- FIXED SECTION BELOW ---
 if __name__ == '__main__':
-     app = create_app(Config)
-     app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
+    # host='0.0.0.0' makes it accessible outside the container
+    # port=5000 matches your docker-compose and pipeline settings
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
