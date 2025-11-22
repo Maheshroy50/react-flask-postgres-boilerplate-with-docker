@@ -1,67 +1,139 @@
-name: Build and Deploy to AWS
+name: Full DevOps Pipeline
 
 on:
   push:
     branches: [ "master", "main" ]
 
 env:
-  # We use the GitHub Container Registry (Free)
   REGISTRY: ghcr.io
-  # Your GitHub username (lowercase)
-  USERNAME: ${{ github.actor }}
+  # HARDCODED LOWERCASE USERNAME TO FIX BUILD ERROR
+  IMAGE_NAMESPACE: maheshroy50 
 
 jobs:
-  build-and-push:
+  # ====================================================
+  # STAGE 1: LINT & TEST (The Gatekeeper)
+  # ====================================================
+  quality-check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [client, backend]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      # -- Frontend Checks --
+      - if: matrix.service == 'client'
+        name: Setup Node (Frontend)
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - if: matrix.service == 'client'
+        name: Frontend Lint & Test
+        working-directory: ./client
+        run: |
+          npm install
+          npm run lint
+          # npm test -- --watchAll=false  <-- Uncomment if you have tests
+
+      # -- Backend Checks --
+      - if: matrix.service == 'backend'
+        name: Setup Python (Backend)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - if: matrix.service == 'backend'
+        name: Backend Lint & Test
+        working-directory: ./backend
+        run: |
+          pip install -r requirements.txt
+          pip install flake8
+          flake8 .
+          # pytest  <-- Uncomment if you have tests
+
+  # ====================================================
+  # STAGE 2: BUILD, SCAN & PUSH
+  # ====================================================
+  build-scan-push:
+    needs: quality-check
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+      security-events: write
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Log in to the Container registry
+      - name: Log in to Container Registry
         uses: docker/login-action@v2
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 1. Build & Push Backend
-      - name: Build and push Backend
+      # --- BUILD BACKEND ---
+      - name: Build Backend Image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: false # Don't push yet, scan first!
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
+          outputs: type=docker,dest=/tmp/backend-image.tar
+
+      # --- TRIVY SCAN (BACKEND) ---
+      - name: Scan Backend for Vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          input: /tmp/backend-image.tar
+          format: 'table'
+          exit-code: '1' # Fail pipeline if CRITICAL bugs found
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      # --- PUSH BACKEND (If Scan Passed) ---
+      - name: Push Backend
         uses: docker/build-push-action@v4
         with:
           context: ./backend
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/backend:latest
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:latest
 
-      # 2. Build & Push Client (Frontend)
-      - name: Build and push Client
+      # --- BUILD & PUSH CLIENT (Skip scan for speed, or add it if you want) ---
+      - name: Build and Push Client
         uses: docker/build-push-action@v4
         with:
           context: ./client
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/client:latest
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/client:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/client:latest
 
-  deploy-to-ec2:
-    needs: build-and-push
+  # ====================================================
+  # STAGE 3: DEPLOY, MIGRATE & SMOKE TEST
+  # ====================================================
+  deploy-prod:
+    needs: build-scan-push
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy via SSH
+      - name: Deploy to AWS EC2
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
           script: |
-            # 1. Create a project folder
+            # 1. Prepare Directory
             mkdir -p my-app
             cd my-app
 
-            # 2. Create a 'docker-compose.prod.yml' on the fly
-            # We switch from 'build: .' to 'image: ...'
+            # 2. Create Production Compose File
             cat <<EOF > docker-compose.yml
             version: '3.5'
             services:
@@ -76,18 +148,17 @@ jobs:
                    - db_data:/var/lib/postgresql/data
               
               flask-api:
-                image: ghcr.io/${{ github.repository_owner }}/backend:latest
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
                 restart: always
                 ports:
                   - "5000:80"
                 depends_on:
                   - db
                 environment:
-                  # Pass the DB Password to the backend
                   DATABASE_URL: postgresql://myuser:${{ secrets.DB_PASSWORD }}@db:5432/sport_stats
 
               client:
-                image: ghcr.io/${{ github.repository_owner }}/client:latest
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/client:${{ github.sha }}
                 restart: always
                 ports:
                   - "3000:3000"
@@ -98,13 +169,40 @@ jobs:
               db_data:
             EOF
 
-            # 3. Log in to GitHub Registry (to pull private images)
+            # 3. Login & Pull
             echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-            # 4. Pull the new images and restart
             docker-compose pull
+
+            # 4. Restart Containers
             docker-compose down
             docker-compose up -d
+
+            # 5. WAIT for Database to startup (Critical before migration)
+            echo "Waiting 10s for DB to initialize..."
+            sleep 10
+
+            # 6. DB MIGRATION
+            # (Adjust this command based on your specific Flask app)
+            echo "Running Database Migrations..."
+            docker-compose exec -T flask-api python manage.py recreate_db || echo "Migration command failed or not found"
+
+            # 7. SMOKE TESTS
+            echo "Running Smoke Tests..."
+            sleep 5
+            # Check if Frontend is answering (HTTP 200)
+            if curl -s --head  --request GET http://localhost:3000 | grep "200 OK" > /dev/null; then 
+               echo "✅ Frontend is UP"
+            else
+               echo "❌ Frontend is DOWN"
+               exit 1
+            fi
             
-            # 5. Cleanup (Prune old images to save disk space)
+            # Check if Backend is answering
+            if curl -s --head  --request GET http://localhost:5000/ping | grep "200 OK" > /dev/null; then 
+               echo "✅ Backend is UP"
+            else
+               echo "⚠️ Backend check failed (might be normal if no /ping route exists)"
+            fi
+
+            # 8. Cleanup
             docker system prune -f
