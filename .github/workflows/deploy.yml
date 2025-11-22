@@ -172,7 +172,7 @@ jobs:
                 image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
                 restart: always
                 ports:
-                  - "5000:80"
+                  - "5000:5000"
                 depends_on:
                   db:
                     condition: service_healthy
