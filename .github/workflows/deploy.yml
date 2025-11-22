@@ -204,8 +204,8 @@ jobs:
             echo "Backend is Up!"
 
             # FIX #2: Run Migrations only after DB and App are ready
-            echo "Running Migrations..."
-            docker-compose exec -T flask-api python manage.py recreate_db
+            #echo "Running Migrations..."
+            #docker-compose exec -T flask-api python manage.py recreate_db
 
             # SMOKE TESTS
             echo "Running Smoke Tests..."
