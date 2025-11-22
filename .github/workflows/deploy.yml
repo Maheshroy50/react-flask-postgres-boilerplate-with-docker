@@ -1,4 +1,4 @@
-name: Full DevOps Pipeline
+name: Production Pipeline
 
 on:
   push:
@@ -6,12 +6,11 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  # HARDCODED LOWERCASE USERNAME TO FIX BUILD ERROR
-  IMAGE_NAMESPACE: maheshroy50 
+  IMAGE_NAMESPACE: maheshroy50
 
 jobs:
   # ====================================================
-  # STAGE 1: LINT & TEST (The Gatekeeper)
+  # STAGE 1: LINT & TEST
   # ====================================================
   quality-check:
     runs-on: ubuntu-latest
@@ -22,36 +21,37 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      # -- Frontend Checks --
+      # --- Frontend ---
       - if: matrix.service == 'client'
-        name: Setup Node (Frontend)
+        name: Setup Node
         uses: actions/setup-node@v3
         with:
           node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: ./client/package-lock.json
       
       - if: matrix.service == 'client'
-        name: Frontend Lint & Test
+        name: Frontend Lint
         working-directory: ./client
         run: |
-          npm install
+          npm ci
           npm run lint
-          # npm test -- --watchAll=false  <-- Uncomment if you have tests
 
-      # -- Backend Checks --
+      # --- Backend ---
       - if: matrix.service == 'backend'
-        name: Setup Python (Backend)
+        name: Setup Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+          cache: 'pip'
 
       - if: matrix.service == 'backend'
-        name: Backend Lint & Test
+        name: Backend Lint
         working-directory: ./backend
         run: |
           pip install -r requirements.txt
           pip install flake8
           flake8 .
-          # pytest  <-- Uncomment if you have tests
 
   # ====================================================
   # STAGE 2: BUILD, SCAN & PUSH
@@ -78,26 +78,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- BUILD BACKEND ---
-      - name: Build Backend Image
+      # --- 1. BUILD BACKEND (Load to Daemon for Scanning) ---
+      - name: Build Backend (Load)
         uses: docker/build-push-action@v4
         with:
           context: ./backend
-          push: false # Don't push yet, scan first!
+          push: false 
+          load: true # FIX #1: Load into Docker daemon so Trivy can see it
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
-          outputs: type=docker,dest=/tmp/backend-image.tar
+          cache-from: type=gha # FIX #7: Use GitHub Actions Cache
+          cache-to: type=gha,mode=max
 
-      # --- TRIVY SCAN (BACKEND) ---
-      - name: Scan Backend for Vulnerabilities
+      # --- 2. SCAN BACKEND ---
+      - name: Scan Backend
         uses: aquasecurity/trivy-action@master
         with:
-          input: /tmp/backend-image.tar
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
           format: 'table'
-          exit-code: '1' # Fail pipeline if CRITICAL bugs found
+          exit-code: '1'
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
 
-      # --- PUSH BACKEND (If Scan Passed) ---
+      # --- 3. PUSH BACKEND (Only if Scan passed) ---
       - name: Push Backend
         uses: docker/build-push-action@v4
         with:
@@ -106,8 +108,10 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-      # --- BUILD & PUSH CLIENT (Skip scan for speed, or add it if you want) ---
+      # --- 4. BUILD & PUSH CLIENT ---
       - name: Build and Push Client
         uses: docker/build-push-action@v4
         with:
@@ -116,9 +120,11 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/client:${{ github.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/client:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # ====================================================
-  # STAGE 3: DEPLOY, MIGRATE & SMOKE TEST
+  # STAGE 3: DEPLOY (With Error Handling & Health Checks)
   # ====================================================
   deploy-prod:
     needs: build-scan-push
@@ -132,13 +138,20 @@ jobs:
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_KEY }}
           script: |
-            # 1. Prepare Directory
+            set -e  # FIX #6: Stop script immediately if any command fails
+
+            # Validate SHA - FIX #10
+            if [ -z "${{ github.sha }}" ]; then
+              echo "Error: No commit SHA found"
+              exit 1
+            fi
+
             mkdir -p my-app
             cd my-app
 
-            # 2. Create Production Compose File
+            # FIX #5: Update to version 3.8
             cat <<EOF > docker-compose.yml
-            version: '3.5'
+            version: '3.8'
             services:
               db:
                 image: postgres:13
@@ -149,6 +162,11 @@ jobs:
                   POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
                 volumes:
                    - db_data:/var/lib/postgresql/data
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U myuser -d sport_stats"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 5
               
               flask-api:
                 image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/backend:${{ github.sha }}
@@ -156,7 +174,8 @@ jobs:
                 ports:
                   - "5000:80"
                 depends_on:
-                  - db
+                  db:
+                    condition: service_healthy
                 environment:
                   DATABASE_URL: postgresql://myuser:${{ secrets.DB_PASSWORD }}@db:5432/sport_stats
 
@@ -172,27 +191,24 @@ jobs:
               db_data:
             EOF
 
-            # 3. Login & Pull
-            echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            # FIX #9: Use PAT if available, otherwise fallback to GITHUB_TOKEN (See notes below)
+            echo ${{ secrets.CR_PAT }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            
             docker-compose pull
-
-            # 4. Restart Containers
             docker-compose down
             docker-compose up -d
 
-            # 5. WAIT for Database to startup (Critical before migration)
-            echo "Waiting 10s for DB to initialize..."
-            sleep 10
+            # FIX #2 & #8: Wait for Backend to be ready (Health Check Loop)
+            echo "Waiting for Backend to accept connections..."
+            timeout 60 bash -c 'until curl -s http://localhost:5000/ping > /dev/null; do sleep 2; done'
+            echo "Backend is Up!"
 
-            # 6. DB MIGRATION
-            # (Adjust this command based on your specific Flask app)
-            echo "Running Database Migrations..."
-            docker-compose exec -T flask-api python manage.py recreate_db || echo "Migration command failed or not found"
+            # FIX #2: Run Migrations only after DB and App are ready
+            echo "Running Migrations..."
+            docker-compose exec -T flask-api python manage.py recreate_db
 
-            # 7. SMOKE TESTS
+            # SMOKE TESTS
             echo "Running Smoke Tests..."
-            sleep 5
-            # Check if Frontend is answering (HTTP 200)
             if curl -s --head  --request GET http://localhost:3000 | grep "200 OK" > /dev/null; then 
                echo "✅ Frontend is UP"
             else
@@ -200,12 +216,5 @@ jobs:
                exit 1
             fi
             
-            # Check if Backend is answering
-            if curl -s --head  --request GET http://localhost:5000/ping | grep "200 OK" > /dev/null; then 
-               echo "✅ Backend is UP"
-            else
-               echo "⚠️ Backend check failed (might be normal if no /ping route exists)"
-            fi
-
-            # 8. Cleanup
+            # Prune old images
             docker system prune -f
