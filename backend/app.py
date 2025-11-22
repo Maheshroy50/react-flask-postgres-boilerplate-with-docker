@@ -5,6 +5,7 @@ from api.api import api
 from api.models import db
 from api.config import Config
 
+
 def create_app(config):
     app = Flask(__name__)
     CORS(app)
@@ -16,6 +17,7 @@ def create_app(config):
 def register_extensions(app):
     api.init_app(app)
     db.init_app(app)
+
 
 app = create_app(Config)
 

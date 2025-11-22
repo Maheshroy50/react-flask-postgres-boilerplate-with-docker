@@ -1,0 +1,7 @@
+[flake8]
+# Match Black's line length limit
+max-line-length = 88
+
+# Ignore errors that clash with Black
+# E203: Whitespace before ':' (Black does this intentionally)
+extend-ignore = E203
