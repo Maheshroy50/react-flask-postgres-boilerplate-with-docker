@@ -1,17 +1,25 @@
-# base image
-FROM node:9.6.1
+# 1. Use Node image
+FROM node:18-alpine
 
-# set working directory
-RUN mkdir /usr/src/app
+# 2. Set working directory
 WORKDIR /usr/src/app
 
-# add `/usr/src/app/node_modules/.bin` to $PATH
-ENV PATH /usr/src/app/node_modules/.bin:$PATH
+# 3. Copy package files first (for caching)
+COPY package*.json ./
 
-# install and cache app dependencies
-COPY package.json /usr/src/app/package.json
-RUN npm install --silent
-RUN npm install react-scripts@1.1.1 -g --silent
+# 4. Install dependencies
+RUN npm install
 
-# start app
+# 5. Copy the REST of the application (including public/ and src/)
+COPY . .
+
+# 6. Expose port
+EXPOSE 3000
+
+# ADD THIS LINE - React needs to bind to 0.0.0.0 in Docker
+ENV HOST=0.0.0.0
+
+# 7. Start the app
+# CI=true ensures it doesn't crash on warnings
+ENV CI=true
 CMD ["npm", "start"]
