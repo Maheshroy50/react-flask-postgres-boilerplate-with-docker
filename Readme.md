@@ -1,6 +1,6 @@
 # ReactJS + Flask (REST API) + PostgreSQL boilerplate with Docker
 
-This project allows to run a quick application with ReactJS (Javascript front-end), Flask (Python backend) and PostgreSQL (relational database) by running it on Docker containers.
+This project allows to run a quick application with ReactJS (Javascript front-end), Flask (Python backend) and PostgreSQL (relational database) by running it on Docker conta.
 
 ### Features
 
